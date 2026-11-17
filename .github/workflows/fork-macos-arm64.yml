@@ -1,0 +1,96 @@
+name: "Fork: macOS arm64 build (unsigned)"
+
+# Personal build of the remote-transcription branch (cjpais/Handy PR #2530)
+# for Apple Silicon. No secrets: no Developer ID signing, no notarization,
+# no updater signature. Tauri signs the bundle ad-hoc (signingIdentity "-"
+# in tauri.conf.json), so macOS permissions have to be granted again after
+# installing it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [cloudflare-remote]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Same runner as upstream's arm64 build: its Xcode has the
+    # FoundationModels SDK, so Apple Intelligence post-processing is built
+    # for real rather than as a stub.
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: fork-macos-arm64
+          cache-bin: false
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      - name: Build app bundle
+        # createUpdaterArtifacts needs TAURI_SIGNING_PRIVATE_KEY, which this
+        # fork doesn't have, so the updater archive is turned off here.
+        run: >-
+          bun run tauri build
+          --target aarch64-apple-darwin
+          --bundles app
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Pack the app
+        # upload-artifact drops file modes and symlinks, so the bundle is
+        # zipped with ditto first, which keeps them and the signature intact.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src-tauri/target/aarch64-apple-darwin/release/bundle/macos
+          codesign --verify --deep --strict --verbose=2 Handy.app
+          codesign -dv --verbose=2 Handy.app 2>&1 | grep -E 'Identifier|Signature|flags|TeamIdentifier'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Handy.app/Contents/Info.plist
+          ditto -c -k --sequesterRsrc --keepParent Handy.app "$GITHUB_WORKSPACE/Handy-arm64.zip"
+          shasum -a 256 "$GITHUB_WORKSPACE/Handy-arm64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Handy-remote-transcription-arm64
+          path: Handy-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  test:
+    # Runs beside the build so it doesn't hold up the artifact.
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: fork-macos-arm64-test
+          cache-bin: false
+      - name: Build frontend (generate_context! needs dist/)
+        run: bun install && bun run build
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
